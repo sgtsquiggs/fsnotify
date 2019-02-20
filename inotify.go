@@ -180,7 +180,7 @@ func (w *Watcher) readEvents() {
 	defer close(w.doneResp)
 	defer close(w.Errors)
 	defer close(w.Events)
-	defer unix.Close(w.fd)
+	defer w.closeFd()
 	defer w.poller.close()
 
 	for {
@@ -252,6 +252,19 @@ func (w *Watcher) readEvents() {
 				case <-w.done:
 					return
 				}
+				errno = w.reinitialize()
+				if errno != nil {
+					err := fmt.Errorf("notify: can't reinitialize after event overflow: %v", errno)
+					select {
+					case w.Errors <- err:
+						w.Close()
+					case <-w.done:
+						return
+					}
+					continue
+				}
+				buf = [unix.SizeofInotifyEvent * 4096]byte{}
+				continue
 			}
 
 			// If the event happened to the watched directory or the watched file, the kernel
@@ -292,6 +305,34 @@ func (w *Watcher) readEvents() {
 			offset += unix.SizeofInotifyEvent + nameLen
 		}
 	}
+}
+
+func (w *Watcher) closeFd() {
+	unix.Close(w.fd)
+}
+
+func (w *Watcher) reinitialize() error {
+	var (
+		fd    int
+		errno error
+		paths map[int]string
+	)
+
+	w.closeFd()
+	fd, errno = unix.InotifyInit1(unix.IN_CLOEXEC)
+	if errno != nil {
+		return errno
+	}
+	paths = w.paths
+	w.fd = fd
+	w.paths = make(map[int]string)
+	w.watches = make(map[string]*watch)
+	for _, path := range paths {
+		if err := w.Add(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Certain types of events can be "ignored" and not sent over the Events
